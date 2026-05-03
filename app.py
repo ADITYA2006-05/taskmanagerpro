@@ -26,8 +26,11 @@ def create_app():
     app.config["SQLALCHEMY_DATABASE_URI"] = db_url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-    # Ensure instance directory exists
-    os.makedirs(os.path.join(basedir, "instance"), exist_ok=True)
+    # Ensure instance directory exists (may fail on read-only cloud filesystems like Vercel)
+    try:
+        os.makedirs(os.path.join(basedir, "instance"), exist_ok=True)
+    except OSError:
+        pass
 
     # ─── Initialize extensions ───
     db.init_app(app)
