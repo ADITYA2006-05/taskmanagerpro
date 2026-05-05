@@ -6,3 +6,5 @@ bcrypt==4.3.0
 python-dateutil==2.9.0
 gunicorn==21.2.0
 psycopg2-binary==2.9.9
+firebase-functions>=0.1.0
+firebase-admin>=6.2.0
