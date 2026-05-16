@@ -265,4 +265,31 @@ input:focus,select:focus,textarea:focus{border-color:var(--primary);box-shadow:0
 .stats-grid{grid-template-columns:1fr}
 .auth-card{padding:24px}
 .form-row{grid-template-columns:1fr!important}
+
+/* ═══ Google Auth ═══ */
+.auth-divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 20px 0;
+    color: var(--text3);
+    font-size: .8rem;
+    font-weight: 600;
+}
+.auth-divider::before, .auth-divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+}
+.google-btn {
+    width: 100%;
+    justify-content: center;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    font-weight: 500;
+}
+.google-btn:hover {
+    background: var(--bg4);
+    border-color: var(--primary);
 }

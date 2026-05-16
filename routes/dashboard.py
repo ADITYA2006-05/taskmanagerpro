@@ -1,45 +1,47 @@
 """
 Dashboard Routes
 ================
-Provides aggregated statistics for the dashboard:
-  - Total, completed, pending counts and completion percentage
-  - Today's tasks
-  - Weekly progress (day-by-day)
-  - Monthly progress
+Provides aggregated statistics for the dashboard.
+Data is read from Firebase Firestore.
 """
 
 from datetime import datetime, date, timedelta, timezone
 from flask import Blueprint, jsonify
 from flask_login import login_required, current_user
-from sqlalchemy import func
-from extensions import db
-from models.task import Task
+from firebase_admin import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 dashboard_bp = Blueprint("dashboard", __name__)
 
+def get_db():
+    return firestore.client()
 
 @dashboard_bp.route("/stats", methods=["GET"])
 @login_required
 def stats():
     """Return overall task statistics and today's tasks."""
-    user_tasks = Task.query.filter_by(user_id=current_user.id)
+    db = get_db()
+    docs = db.collection("tasks").where(filter=FieldFilter("user_id", "==", current_user.id)).stream()
+    
+    tasks = []
+    for doc in docs:
+        task = doc.to_dict()
+        task["id"] = doc.id
+        tasks.append(task)
 
-    total = user_tasks.count()
-    completed = user_tasks.filter_by(status="completed").count()
-    pending = user_tasks.filter_by(status="pending").count()
+    total = len(tasks)
+    completed = sum(1 for t in tasks if t.get("status") == "completed")
+    pending = total - completed
     completion_pct = round((completed / total) * 100, 1) if total > 0 else 0
 
-    today = date.today()
-    todays_tasks = [
-        t.to_dict()
-        for t in user_tasks.filter(Task.due_date == today).order_by(Task.position).all()
-    ]
+    today_str = date.today().isoformat()
+    
+    # Get today's tasks
+    todays_tasks = [t for t in tasks if t.get("due_date") == today_str]
+    todays_tasks.sort(key=lambda t: t.get("position", 0))
 
     # Overdue count
-    overdue = user_tasks.filter(
-        Task.due_date < today,
-        Task.status == "pending",
-    ).count()
+    overdue = sum(1 for t in tasks if t.get("due_date") and t.get("due_date") < today_str and t.get("status") == "pending")
 
     return jsonify({
         "total": total,
@@ -56,20 +58,24 @@ def stats():
 @login_required
 def weekly():
     """Return day-by-day task completion data for the current week (Mon–Sun)."""
+    db = get_db()
+    docs = db.collection("tasks").where(filter=FieldFilter("user_id", "==", current_user.id)).stream()
+    tasks = [doc.to_dict() for doc in docs]
+
     today = date.today()
-    # Monday of this week
     start_of_week = today - timedelta(days=today.weekday())
     days = []
 
     for i in range(7):
         d = start_of_week + timedelta(days=i)
-        day_tasks = Task.query.filter_by(user_id=current_user.id).filter(
-            Task.due_date == d
-        )
-        total = day_tasks.count()
-        completed = day_tasks.filter_by(status="completed").count()
+        d_str = d.isoformat()
+        
+        day_tasks = [t for t in tasks if t.get("due_date") == d_str]
+        total = len(day_tasks)
+        completed = sum(1 for t in day_tasks if t.get("status") == "completed")
+        
         days.append({
-            "date": d.isoformat(),
+            "date": d_str,
             "day_name": d.strftime("%a"),
             "total": total,
             "completed": completed,
@@ -83,10 +89,13 @@ def weekly():
 @login_required
 def monthly():
     """Return day-by-day task data for the current month."""
+    db = get_db()
+    docs = db.collection("tasks").where(filter=FieldFilter("user_id", "==", current_user.id)).stream()
+    tasks = [doc.to_dict() for doc in docs]
+
     today = date.today()
     first_day = today.replace(day=1)
 
-    # Get the last day of the month
     if today.month == 12:
         last_day = today.replace(year=today.year + 1, month=1, day=1) - timedelta(days=1)
     else:
@@ -95,13 +104,14 @@ def monthly():
     days = []
     current = first_day
     while current <= last_day:
-        day_tasks = Task.query.filter_by(user_id=current_user.id).filter(
-            Task.due_date == current
-        )
-        total = day_tasks.count()
-        completed = day_tasks.filter_by(status="completed").count()
+        current_str = current.isoformat()
+        day_tasks = [t for t in tasks if t.get("due_date") == current_str]
+        
+        total = len(day_tasks)
+        completed = sum(1 for t in day_tasks if t.get("status") == "completed")
+        
         days.append({
-            "date": current.isoformat(),
+            "date": current_str,
             "total": total,
             "completed": completed,
         })

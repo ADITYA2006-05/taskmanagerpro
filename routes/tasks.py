@@ -3,80 +3,74 @@ Task Routes
 ===========
 Full CRUD for tasks, plus search, filter, sort, and drag-and-drop reorder.
 All endpoints are scoped to the currently authenticated user.
+Data is stored in Firebase Firestore.
 """
 
-from datetime import datetime, date, time, timezone
+from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from flask_login import login_required, current_user
-from extensions import db
-from models.task import Task
+from firebase_admin import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 tasks_bp = Blueprint("tasks", __name__)
 
+def get_db():
+    return firestore.client()
 
 @tasks_bp.route("", methods=["GET"])
 @login_required
 def list_tasks():
     """
     List all tasks for the current user.
-    Query params:
-      - search: search title & description
-      - priority: filter by low/medium/high
-      - status: filter by pending/completed
-      - sort: due_date, priority, created_at, status (prefix with - for desc)
-      - date_from / date_to: filter by due date range
     """
-    query = Task.query.filter_by(user_id=current_user.id)
+    db = get_db()
+    # Fetch all tasks for the user
+    docs = db.collection("tasks").where(filter=FieldFilter("user_id", "==", current_user.id)).stream()
+    
+    tasks = []
+    for doc in docs:
+        task = doc.to_dict()
+        task["id"] = doc.id
+        tasks.append(task)
 
     # ─── Search ───
-    search = request.args.get("search", "").strip()
+    search = request.args.get("search", "").strip().lower()
     if search:
-        like = f"%{search}%"
-        query = query.filter(
-            (Task.title.ilike(like)) | (Task.description.ilike(like))
-        )
+        tasks = [t for t in tasks if search in t.get("title", "").lower() or search in t.get("description", "").lower()]
 
     # ─── Filter by priority ───
     priority = request.args.get("priority", "").strip().lower()
     if priority in ("low", "medium", "high"):
-        query = query.filter_by(priority=priority)
+        tasks = [t for t in tasks if t.get("priority") == priority]
 
     # ─── Filter by status ───
     status = request.args.get("status", "").strip().lower()
     if status in ("pending", "completed"):
-        query = query.filter_by(status=status)
+        tasks = [t for t in tasks if t.get("status") == status]
 
     # ─── Filter by date range ───
     date_from = request.args.get("date_from")
     date_to = request.args.get("date_to")
     if date_from:
-        try:
-            query = query.filter(Task.due_date >= date.fromisoformat(date_from))
-        except ValueError:
-            pass
+        tasks = [t for t in tasks if t.get("due_date") and t.get("due_date") >= date_from]
     if date_to:
-        try:
-            query = query.filter(Task.due_date <= date.fromisoformat(date_to))
-        except ValueError:
-            pass
+        tasks = [t for t in tasks if t.get("due_date") and t.get("due_date") <= date_to]
 
     # ─── Sort ───
     sort = request.args.get("sort", "position").strip()
     descending = sort.startswith("-")
     sort_field = sort.lstrip("-")
+    
+    def get_sort_key(t):
+        val = t.get(sort_field)
+        if val is None:
+            # Return appropriate empty value based on sort field to avoid comparison errors
+            if sort_field in ("position",): return 0
+            return ""
+        return val
 
-    sort_map = {
-        "due_date": Task.due_date,
-        "priority": Task.priority,
-        "created_at": Task.created_at,
-        "status": Task.status,
-        "position": Task.position,
-        "title": Task.title,
-    }
-    col = sort_map.get(sort_field, Task.position)
-    query = query.order_by(col.desc() if descending else col.asc())
+    tasks.sort(key=get_sort_key, reverse=descending)
 
-    tasks = [t.to_dict() for t in query.all()]
     return jsonify({"tasks": tasks}), 200
 
 
@@ -90,124 +84,139 @@ def create_task():
     if not title:
         return jsonify({"error": "Task title is required"}), 400
 
-    # Get the next position value
-    max_pos = db.session.query(db.func.max(Task.position)).filter_by(
-        user_id=current_user.id
-    ).scalar() or 0
+    db = get_db()
+    
+    # Get max position (in-memory for simplicity since n is small)
+    docs = db.collection("tasks").where(filter=FieldFilter("user_id", "==", current_user.id)).stream()
+    max_pos = -1
+    for doc in docs:
+        pos = doc.to_dict().get("position", 0)
+        if pos > max_pos:
+            max_pos = pos
 
-    task = Task(
-        user_id=current_user.id,
-        title=title,
-        description=data.get("description", "").strip(),
-        priority=data.get("priority", "medium").lower(),
-        status="pending",
-        position=max_pos + 1,
-    )
+    task_data = {
+        "user_id": current_user.id,
+        "title": title,
+        "description": data.get("description", "").strip(),
+        "priority": data.get("priority", "medium").lower(),
+        "status": "pending",
+        "position": max_pos + 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "due_date": data.get("due_date") or None,
+        "due_time": data.get("due_time") or None
+    }
 
-    # Parse due date
-    due_date_str = data.get("due_date")
-    if due_date_str:
+    # Validate dates (just format check, keeping them as strings)
+    if task_data["due_date"]:
         try:
-            task.due_date = date.fromisoformat(due_date_str)
+            datetime.fromisoformat(task_data["due_date"])
         except ValueError:
-            return jsonify({"error": "Invalid due_date format. Use YYYY-MM-DD"}), 400
-
-    # Parse due time
-    due_time_str = data.get("due_time")
-    if due_time_str:
+            return jsonify({"error": "Invalid due_date format"}), 400
+            
+    if task_data["due_time"]:
         try:
-            task.due_time = time.fromisoformat(due_time_str)
+            datetime.strptime(task_data["due_time"], "%H:%M")
         except ValueError:
-            return jsonify({"error": "Invalid due_time format. Use HH:MM"}), 400
+            return jsonify({"error": "Invalid due_time format"}), 400
 
-    db.session.add(task)
-    db.session.commit()
+    _, doc_ref = db.collection("tasks").add(task_data)
+    task_data["id"] = doc_ref.id
 
-    return jsonify({"message": "Task created", "task": task.to_dict()}), 201
+    return jsonify({"message": "Task created", "task": task_data}), 201
 
 
-@tasks_bp.route("/<int:task_id>", methods=["PUT"])
+@tasks_bp.route("/<task_id>", methods=["PUT"])
 @login_required
 def update_task(task_id):
     """Update an existing task."""
-    task = Task.query.filter_by(id=task_id, user_id=current_user.id).first()
-    if not task:
+    db = get_db()
+    doc_ref = db.collection("tasks").document(task_id)
+    doc = doc_ref.get()
+    
+    if not doc.exists or doc.to_dict().get("user_id") != current_user.id:
         return jsonify({"error": "Task not found"}), 404
 
     data = request.get_json()
+    task = doc.to_dict()
+    updates = {}
 
     if "title" in data:
         title = data["title"].strip()
         if not title:
             return jsonify({"error": "Task title cannot be empty"}), 400
-        task.title = title
+        updates["title"] = title
 
     if "description" in data:
-        task.description = data["description"].strip()
+        updates["description"] = data["description"].strip()
 
     if "priority" in data and data["priority"].lower() in ("low", "medium", "high"):
-        task.priority = data["priority"].lower()
+        updates["priority"] = data["priority"].lower()
 
     if "status" in data and data["status"].lower() in ("pending", "completed"):
-        old_status = task.status
-        task.status = data["status"].lower()
-        if task.status == "completed" and old_status != "completed":
-            task.completed_at = datetime.now(timezone.utc)
-        elif task.status == "pending":
-            task.completed_at = None
+        old_status = task.get("status")
+        new_status = data["status"].lower()
+        updates["status"] = new_status
+        if new_status == "completed" and old_status != "completed":
+            updates["completed_at"] = datetime.now(timezone.utc).isoformat()
+        elif new_status == "pending":
+            updates["completed_at"] = None
 
     if "due_date" in data:
-        if data["due_date"]:
-            try:
-                task.due_date = date.fromisoformat(data["due_date"])
-            except ValueError:
-                return jsonify({"error": "Invalid due_date format"}), 400
-        else:
-            task.due_date = None
+        updates["due_date"] = data["due_date"] or None
 
     if "due_time" in data:
-        if data["due_time"]:
-            try:
-                task.due_time = time.fromisoformat(data["due_time"])
-            except ValueError:
-                return jsonify({"error": "Invalid due_time format"}), 400
-        else:
-            task.due_time = None
+        updates["due_time"] = data["due_time"] or None
 
-    db.session.commit()
-    return jsonify({"message": "Task updated", "task": task.to_dict()}), 200
+    if updates:
+        doc_ref.update(updates)
+        task.update(updates)
+        
+    task["id"] = doc.id
+    return jsonify({"message": "Task updated", "task": task}), 200
 
 
-@tasks_bp.route("/<int:task_id>", methods=["DELETE"])
+@tasks_bp.route("/<task_id>", methods=["DELETE"])
 @login_required
 def delete_task(task_id):
     """Delete a task."""
-    task = Task.query.filter_by(id=task_id, user_id=current_user.id).first()
-    if not task:
+    db = get_db()
+    doc_ref = db.collection("tasks").document(task_id)
+    doc = doc_ref.get()
+    
+    if not doc.exists or doc.to_dict().get("user_id") != current_user.id:
         return jsonify({"error": "Task not found"}), 404
 
-    db.session.delete(task)
-    db.session.commit()
+    doc_ref.delete()
     return jsonify({"message": "Task deleted"}), 200
 
 
-@tasks_bp.route("/<int:task_id>/toggle", methods=["PATCH"])
+@tasks_bp.route("/<task_id>/toggle", methods=["PATCH"])
 @login_required
 def toggle_task(task_id):
     """Toggle a task between pending and completed."""
-    task = Task.query.filter_by(id=task_id, user_id=current_user.id).first()
-    if not task:
+    db = get_db()
+    doc_ref = db.collection("tasks").document(task_id)
+    doc = doc_ref.get()
+    
+    if not doc.exists or doc.to_dict().get("user_id") != current_user.id:
         return jsonify({"error": "Task not found"}), 404
 
-    if task.status == "completed":
-        task.status = "pending"
-        task.completed_at = None
+    task = doc.to_dict()
+    updates = {}
+    
+    if task.get("status") == "completed":
+        updates["status"] = "pending"
+        updates["completed_at"] = None
     else:
-        task.status = "completed"
-        task.completed_at = datetime.now(timezone.utc)
+        updates["status"] = "completed"
+        updates["completed_at"] = datetime.now(timezone.utc).isoformat()
 
-    db.session.commit()
-    return jsonify({"message": "Task toggled", "task": task.to_dict()}), 200
+    doc_ref.update(updates)
+    task.update(updates)
+    task["id"] = doc.id
+    
+    return jsonify({"message": "Task toggled", "task": task}), 200
 
 
 @tasks_bp.route("/reorder", methods=["PUT"])
@@ -223,10 +232,14 @@ def reorder_tasks():
     if not order:
         return jsonify({"error": "Order list is required"}), 400
 
+    db = get_db()
+    batch = db.batch()
+    
     for position, task_id in enumerate(order):
-        task = Task.query.filter_by(id=task_id, user_id=current_user.id).first()
-        if task:
-            task.position = position
+        # Using integer cast is incorrect for task_id because it's a string in Firestore
+        task_id = str(task_id)
+        doc_ref = db.collection("tasks").document(task_id)
+        batch.update(doc_ref, {"position": position})
 
-    db.session.commit()
+    batch.commit()
     return jsonify({"message": "Tasks reordered"}), 200

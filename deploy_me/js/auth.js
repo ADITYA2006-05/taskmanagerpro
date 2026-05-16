@@ -10,8 +10,8 @@ const Auth = {
             <p class="subtitle">Sign in to manage your tasks</p>
             <form class="auth-form" id="login-form">
                 <div class="form-group">
-                    <label for="login-username">Username or Email</label>
-                    <input type="text" id="login-username" placeholder="Enter username or email" required>
+                    <label for="login-email">Email</label>
+                    <input type="email" id="login-email" placeholder="Enter email" required>
                 </div>
                 <div class="form-group">
                     <label for="login-password">Password</label>
@@ -20,9 +20,15 @@ const Auth = {
                 <div class="auth-error" id="login-error"></div>
                 <button type="submit" class="btn btn-primary">Sign In</button>
             </form>
+            <div class="auth-divider"><span>OR</span></div>
+            <button id="google-login-btn" class="btn btn-secondary google-btn">
+                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="18" height="18">
+                Continue with Google
+            </button>
             <p class="auth-switch">Don't have an account? <a id="show-signup">Sign Up</a></p>
         `;
         document.getElementById('login-form').addEventListener('submit', (e) => this.handleLogin(e));
+        document.getElementById('google-login-btn').addEventListener('click', () => this.handleGoogleLogin());
         document.getElementById('show-signup').addEventListener('click', () => this.showSignup());
     },
 
@@ -47,9 +53,15 @@ const Auth = {
                 <div class="auth-error" id="signup-error"></div>
                 <button type="submit" class="btn btn-primary">Create Account</button>
             </form>
+            <div class="auth-divider"><span>OR</span></div>
+            <button id="google-signup-btn" class="btn btn-secondary google-btn">
+                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="18" height="18">
+                Continue with Google
+            </button>
             <p class="auth-switch">Already have an account? <a id="show-login">Sign In</a></p>
         `;
         document.getElementById('signup-form').addEventListener('submit', (e) => this.handleSignup(e));
+        document.getElementById('google-signup-btn').addEventListener('click', () => this.handleGoogleLogin());
         document.getElementById('show-login').addEventListener('click', () => this.showLogin());
     },
 
@@ -58,16 +70,10 @@ const Auth = {
         const errEl = document.getElementById('login-error');
         errEl.textContent = '';
         try {
-            const data = await App.api('/api/auth/login', {
-                method: 'POST',
-                body: JSON.stringify({
-                    username: document.getElementById('login-username').value.trim(),
-                    password: document.getElementById('login-password').value
-                })
-            });
-            App.user = data.user;
-            App.showApp();
-            App.toast('Welcome back, ' + data.user.username + '!', 'success');
+            const email = document.getElementById('login-email').value.trim();
+            const password = document.getElementById('login-password').value;
+            await firebase.auth().signInWithEmailAndPassword(email, password);
+            App.toast('Welcome back!', 'success');
         } catch (err) {
             errEl.textContent = err.message;
         }
@@ -78,19 +84,26 @@ const Auth = {
         const errEl = document.getElementById('signup-error');
         errEl.textContent = '';
         try {
-            const data = await App.api('/api/auth/signup', {
-                method: 'POST',
-                body: JSON.stringify({
-                    username: document.getElementById('signup-username').value.trim(),
-                    email: document.getElementById('signup-email').value.trim(),
-                    password: document.getElementById('signup-password').value
-                })
-            });
-            App.user = data.user;
-            App.showApp();
-            App.toast('Account created! Welcome, ' + data.user.username + '!', 'success');
+            const username = document.getElementById('signup-username').value.trim();
+            const email = document.getElementById('signup-email').value.trim();
+            const password = document.getElementById('signup-password').value;
+            
+            const userCredential = await firebase.auth().createUserWithEmailAndPassword(email, password);
+            await userCredential.user.updateProfile({ displayName: username });
+            
+            App.toast('Account created! Welcome, ' + username + '!', 'success');
         } catch (err) {
             errEl.textContent = err.message;
+        }
+    },
+
+    async handleGoogleLogin() {
+        try {
+            const provider = new firebase.auth.GoogleAuthProvider();
+            // Use redirect instead of popup to avoid COOP security blockers
+            await firebase.auth().signInWithRedirect(provider);
+        } catch (err) {
+            App.toast(err.message, 'error');
         }
     }
 };

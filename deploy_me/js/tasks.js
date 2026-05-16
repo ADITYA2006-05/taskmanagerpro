@@ -29,30 +29,30 @@ const Tasks = {
     },
 
     async loadTasks() {
-        const params = new URLSearchParams();
-        const search = document.getElementById('search-input').value.trim();
-        const priority = document.getElementById('filter-priority')?.value;
-        const status = document.getElementById('filter-status')?.value;
-        const sort = document.getElementById('filter-sort')?.value;
-        if (search) params.set('search', search);
-        if (priority) params.set('priority', priority);
-        if (status) params.set('status', status);
-        if (sort) params.set('sort', sort);
-
         try {
-            const data = await App.api(`/api/tasks?${params}`);
-            const list = document.getElementById('task-list');
-            if (!list) return;
-            if (data.tasks.length === 0) {
-                list.innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg><h3>No tasks found</h3><p>Click "Add Task" to create your first task</p></div>';
-                return;
-            }
-            list.innerHTML = data.tasks.map(t => this.taskHTML(t)).join('');
-            this.bindTaskEvents();
-            this.initDragDrop();
+            const filters = {
+                search: document.getElementById('search-input')?.value,
+                priority: document.getElementById('filter-priority')?.value,
+                status: document.getElementById('filter-status')?.value,
+                sort: document.getElementById('filter-sort')?.value
+            };
+            const tasks = await Firestore.getTasks(filters);
+            this.renderTasks(tasks);
         } catch (err) {
-            App.toast(err.message, 'error');
+            App.toast('Failed to load tasks', 'error');
         }
+    },
+
+    renderTasks(tasks) {
+        const list = document.getElementById('task-list');
+        if (!list) return;
+        if (tasks.length === 0) {
+            list.innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg><h3>No tasks found</h3><p>Click "Add Task" to create your first task</p></div>';
+            return;
+        }
+        list.innerHTML = tasks.map(t => this.taskHTML(t)).join('');
+        this.bindTaskEvents();
+        this.initDragDrop();
     },
 
     taskHTML(t) {
@@ -60,7 +60,7 @@ const Tasks = {
         return `
         <div class="task-item ${checked ? 'completed' : ''}" data-id="${t.id}">
             <div class="drag-handle"><svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/></svg></div>
-            <div class="task-check ${checked ? 'checked' : ''}" data-id="${t.id}">
+            <div class="task-check ${checked ? 'checked' : ''}" data-id="${t.id}" data-status="${t.status}">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
             </div>
             <div class="task-body">
@@ -81,7 +81,7 @@ const Tasks = {
 
     bindTaskEvents() {
         document.querySelectorAll('.task-check').forEach(el => {
-            el.addEventListener('click', () => this.toggleTask(el.dataset.id));
+            el.addEventListener('click', () => this.toggleTask(el.dataset.id, el.dataset.status));
         });
         document.querySelectorAll('.edit-btn').forEach(el => {
             el.addEventListener('click', () => this.editTask(el.dataset.id));
@@ -99,35 +99,38 @@ const Tasks = {
             animation: 200,
             ghostClass: 'sortable-ghost',
             onEnd: async () => {
-                const order = [...list.querySelectorAll('.task-item')].map(el => parseInt(el.dataset.id));
-                try { await App.api('/api/tasks/reorder', { method: 'PUT', body: JSON.stringify({ order }) }); }
+                const order = [...list.querySelectorAll('.task-item')].map(el => el.dataset.id);
+                try { await Firestore.reorderTasks(order); }
                 catch (err) { App.toast('Reorder failed', 'error'); }
             }
         });
     },
 
-    async toggleTask(id) {
+    async toggleTask(id, currentStatus) {
         try {
-            await App.api(`/api/tasks/${id}/toggle`, { method: 'PATCH' });
-            await this.loadTasks();
-        } catch (err) { App.toast(err.message, 'error'); }
+            await Firestore.toggleTask(id, currentStatus);
+            this.loadTasks();
+        } catch (err) {
+            App.toast('Failed to update task', 'error');
+        }
     },
 
     async deleteTask(id) {
-        if (!confirm('Delete this task?')) return;
+        if (!confirm('Are you sure you want to delete this task?')) return;
         try {
-            await App.api(`/api/tasks/${id}`, { method: 'DELETE' });
-            App.toast('Task deleted', 'success');
-            await this.loadTasks();
-        } catch (err) { App.toast(err.message, 'error'); }
+            await Firestore.deleteTask(id);
+            App.toast('Task deleted', 'info');
+            this.loadTasks();
+        } catch (err) {
+            App.toast('Failed to delete task', 'error');
+        }
     },
 
     async editTask(id) {
         try {
-            const data = await App.api('/api/tasks');
-            const task = data.tasks.find(t => t.id == id);
+            const task = await Firestore.getTask(id);
             if (task) this.showModal(task);
-        } catch (err) { App.toast(err.message, 'error'); }
+        } catch (err) { App.toast('Could not fetch task', 'error'); }
     },
 
     showModal(task = null) {
@@ -162,7 +165,7 @@ const Tasks = {
         document.getElementById('modal-cancel').addEventListener('click', () => overlay.remove());
         document.getElementById('task-form').addEventListener('submit', async (e) => {
             e.preventDefault();
-            const body = {
+            const data = {
                 title: document.getElementById('modal-title').value.trim(),
                 description: document.getElementById('modal-desc').value.trim(),
                 due_date: document.getElementById('modal-date').value || null,
@@ -171,11 +174,11 @@ const Tasks = {
             };
             try {
                 if (isEdit) {
-                    await App.api(`/api/tasks/${task.id}`, { method: 'PUT', body: JSON.stringify(body) });
+                    await Firestore.updateTask(task.id, data);
                     App.toast('Task updated', 'success');
                 } else {
-                    await App.api('/api/tasks', { method: 'POST', body: JSON.stringify(body) });
-                    App.toast('Task created', 'success');
+                    await Firestore.addTask(data);
+                    App.toast('Task added successfully', 'success');
                 }
                 overlay.remove();
                 await this.loadTasks();

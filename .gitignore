@@ -7,3 +7,5 @@ venv/
 ENV/
 env/
 .env
+.firebase/
+firebase.exe

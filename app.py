@@ -3,51 +3,74 @@ Task Manager Web App — Flask Application Factory
 """
 
 import os
-from flask import Flask, send_from_directory, render_template
-from extensions import db, login_manager, migrate
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+from flask_login import LoginManager
+from flask_cors import CORS
+import firebase_admin
+from firebase_admin import credentials, auth, firestore
 
+# Load environment variables from .env file
+load_dotenv()
+
+login_manager = LoginManager()
+
+# Simple User class for Flask-Login
+class User:
+    def __init__(self, uid, email):
+        self.id = uid
+        self.email = email
+        self.is_active = True
+        self.is_authenticated = True
+        
+    def to_dict(self):
+        return {"id": self.id, "email": self.email}
 
 def create_app():
     """Create and configure the Flask application."""
-    app = Flask(
-        __name__,
-        static_folder="static",
-        template_folder="templates",
-    )
+    app = Flask(__name__, static_folder="public", static_url_path="/")
+    CORS(app)  # Enable CORS for all routes
 
-    # ─── Configuration ───
     app.config["SECRET_KEY"] = os.environ.get(
         "SECRET_KEY", "task-manager-dev-secret-key-change-in-prod"
     )
-    basedir = os.path.abspath(os.path.dirname(__file__))
-    db_url = os.environ.get("DATABASE_URL", f"sqlite:///{os.path.join(basedir, 'instance', 'taskmanager.db')}")
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
-    app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-    # Ensure instance directory exists (may fail on read-only cloud filesystems like Vercel)
-    try:
-        os.makedirs(os.path.join(basedir, "instance"), exist_ok=True)
-    except OSError:
-        pass
-
-    # ─── Initialize extensions ───
-    db.init_app(app)
     login_manager.init_app(app)
-    migrate.init_app(app, db)
+    
+    # ─── Initialize Firebase Admin ───
+    if not firebase_admin._apps:
+        try:
+            # Explicitly pass the projectId so it works in environments without default credentials
+            project_id = os.environ.get("FIREBASE_PROJECT_ID")
+            if project_id:
+                firebase_admin.initialize_app(options={'projectId': project_id})
+            else:
+                firebase_admin.initialize_app()
+        except Exception as e:
+            print(f"Failed to initialize Firebase Admin: {e}")
 
-    # ─── User loader for Flask-Login ───
-    from models.user import User
+    # Make Firestore client available globally or attach to app
+    app.db = firestore.client()
 
-    @login_manager.user_loader
-    def load_user(user_id):
-        return db.session.get(User, int(user_id))
+    # ─── User loader for Flask-Login (via Firebase Token) ───
+    @login_manager.request_loader
+    def load_user_from_request(request):
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+            try:
+                decoded_token = auth.verify_id_token(token)
+                uid = decoded_token.get('uid')
+                email = decoded_token.get('email')
+                return User(uid, email)
+            except Exception as e:
+                # Token invalid or expired
+                return None
+        return None
 
     # Return 401 JSON for unauthorized API requests
     @login_manager.unauthorized_handler
     def unauthorized():
-        from flask import jsonify
         return jsonify({"error": "Authentication required"}), 401
 
     # ─── Register blueprints ───
@@ -64,22 +87,17 @@ def create_app():
     app.register_blueprint(calendar_bp, url_prefix="/api/calendar")
 
     # ─── Serve the SPA shell for all non-API routes ───
+    from flask import send_from_directory
     @app.route("/")
     @app.route("/<path:path>")
     def serve_spa(path=""):
         if path and os.path.exists(os.path.join(app.static_folder, path)):
             return send_from_directory(app.static_folder, path)
-        return render_template("index.html")
-
-    # ─── Create database tables on first run ───
-    with app.app_context():
-        import models  # noqa: F401
-        db.create_all()
+        return send_from_directory(app.static_folder, "index.html")
 
     return app
 
-
-# Create global app instance for serverless deployments (like Vercel)
+# Create global app instance for serverless deployments
 app = create_app()
 
 if __name__ == "__main__":

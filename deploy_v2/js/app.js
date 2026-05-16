@@ -8,10 +8,52 @@ const App = {
     user: null,
 
     /** Initialize the application */
-    async init() {
+    init() {
+        // Global error monitor to catch hidden browser issues
+        window.onerror = (msg, url, line) => {
+            console.error("Global Error:", msg, "at", url, ":", line);
+            this.toast("System Error: " + msg, "error");
+        };
+
         this.bindEvents();
         this.loadTheme();
-        await this.checkAuth();
+        this.setupFirebaseAuth();
+    },
+
+    /** Listen to Firebase Auth state changes */
+    async setupFirebaseAuth() {
+        console.log("Initializing Auth...");
+        
+        // Handle the result of a redirect sign-in
+        try {
+            const result = await firebase.auth().getRedirectResult();
+            if (result.user) {
+                console.log("Redirect login successful:", result.user.email);
+            }
+        } catch (err) {
+            console.error("Auth redirect error:", err);
+            this.toast("Login failed: " + err.message, 'error');
+        }
+
+        firebase.auth().onAuthStateChanged(async (user) => {
+            console.log("Auth state changed. User:", user ? user.email : "null");
+            if (user) {
+                this.user = { 
+                    id: user.uid, 
+                    email: user.email, 
+                    username: user.displayName || user.email.split('@')[0] 
+                };
+                try {
+                    this.showApp();
+                } catch (err) {
+                    console.error("showApp failed:", err);
+                    this.toast("App failed to start: " + err.message, 'error');
+                }
+            } else {
+                this.user = null;
+                this.showAuth();
+            }
+        });
     },
 
     /** Bind global event listeners */
@@ -48,22 +90,6 @@ const App = {
         });
     },
 
-    /** Check if user is authenticated */
-    async checkAuth() {
-        try {
-            const res = await fetch('/api/auth/me');
-            if (res.ok) {
-                const data = await res.json();
-                this.user = data.user;
-                this.showApp();
-            } else {
-                this.showAuth();
-            }
-        } catch {
-            this.showAuth();
-        }
-    },
-
     /** Show the auth screens */
     showAuth() {
         document.getElementById('auth-container').classList.remove('hidden');
@@ -73,16 +99,18 @@ const App = {
 
     /** Show the main app */
     showApp() {
+        console.log("Showing App UI...");
         document.getElementById('auth-container').classList.add('hidden');
         document.getElementById('app-container').classList.remove('hidden');
 
         // Update user info in sidebar
         const avatar = document.getElementById('user-avatar');
         const name = document.getElementById('user-name');
-        if (this.user) {
-            avatar.textContent = this.user.username.charAt(0).toUpperCase();
-            name.textContent = this.user.username;
-        }
+        
+        const displayName = this.user?.username || firebase.auth().currentUser?.displayName || 'User';
+        
+        if (avatar) avatar.textContent = displayName.charAt(0).toUpperCase();
+        if (name) name.textContent = displayName;
 
         this.navigate('dashboard');
         this.checkDueNotifications();
@@ -120,9 +148,7 @@ const App = {
 
     /** Logout */
     async logout() {
-        await fetch('/api/auth/logout', { method: 'POST' });
-        this.user = null;
-        this.showAuth();
+        await firebase.auth().signOut();
         App.toast('Logged out', 'info');
     },
 
@@ -160,21 +186,34 @@ const App = {
     /** Check for tasks due today and notify */
     async checkDueNotifications() {
         try {
-            const res = await fetch('/api/dashboard/stats');
-            if (!res.ok) return;
-            const data = await res.json();
-            if (data.todays_count > 0) {
-                this.toast(`You have ${data.todays_count} task(s) due today!`, 'warning', 6000);
+            const tasks = await Firestore.getTasks();
+            const today = new Date().toISOString().split('T')[0];
+            const todaysCount = tasks.filter(t => t.due_date === today).length;
+            const overdue = tasks.filter(t => t.due_date && t.due_date < today && t.status === 'pending').length;
+
+            if (todaysCount > 0) {
+                this.toast(`You have ${todaysCount} task(s) due today!`, 'warning', 6000);
             }
-            if (data.overdue > 0) {
-                this.toast(`${data.overdue} task(s) are overdue!`, 'error', 6000);
+            if (overdue > 0) {
+                this.toast(`${overdue} task(s) are overdue!`, 'error', 6000);
             }
-        } catch {}
+        } catch (err) {
+            console.error("Notification check failed", err);
+        }
     },
 
     /** API helper */
     async api(url, options = {}) {
-        const defaults = { headers: { 'Content-Type': 'application/json' } };
+        const headers = { 'Content-Type': 'application/json' };
+        
+        // Add Firebase ID Token if user is logged in
+        const currentUser = firebase.auth().currentUser;
+        if (currentUser) {
+            const token = await currentUser.getIdToken();
+            headers['Authorization'] = `Bearer ${token}`;
+        }
+
+        const defaults = { headers };
         const res = await fetch(url, { ...defaults, ...options });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Request failed');

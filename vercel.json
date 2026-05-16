@@ -8,6 +8,14 @@
   ],
   "routes": [
     {
+      "src": "/(css|js|images|static)/(.*)",
+      "dest": "/public/$1/$2"
+    },
+    {
+      "src": "/api/(.*)",
+      "dest": "app.py"
+    },
+    {
       "src": "/(.*)",
       "dest": "app.py"
     }

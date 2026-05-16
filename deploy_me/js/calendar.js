@@ -6,7 +6,7 @@
 const Calendar = {
     month: new Date().getMonth() + 1,
     year: new Date().getFullYear(),
-    data: null,
+    tasksByDate: {},
 
     async render(container) {
         container.innerHTML = `
@@ -21,24 +21,40 @@ const Calendar = {
             <div class="calendar-grid" id="cal-grid"></div>
             <div id="day-detail"></div>
         `;
-        document.getElementById('cal-prev').addEventListener('click', () => { this.month--; if (this.month < 1) { this.month = 12; this.year--; } this.load(); });
-        document.getElementById('cal-next').addEventListener('click', () => { this.month++; if (this.month > 12) { this.month = 1; this.year++; } this.load(); });
-        document.getElementById('cal-today').addEventListener('click', () => { this.month = new Date().getMonth() + 1; this.year = new Date().getFullYear(); this.load(); });
-        await this.load();
+        document.getElementById('cal-prev').addEventListener('click', () => { this.month--; if (this.month < 1) { this.month = 12; this.year--; } this.loadTasks(); });
+        document.getElementById('cal-next').addEventListener('click', () => { this.month++; if (this.month > 12) { this.month = 1; this.year++; } this.loadTasks(); });
+        document.getElementById('cal-today').addEventListener('click', () => { this.month = new Date().getMonth() + 1; this.year = new Date().getFullYear(); this.loadTasks(); });
+        await this.loadTasks();
     },
 
-    async load() {
+    async loadTasks() {
         try {
-            this.data = await App.api(`/api/calendar/tasks?month=${this.month}&year=${this.year}`);
-            document.getElementById('cal-title').textContent = `${this.data.month_name} ${this.data.year}`;
+            const firstDay = new Date(this.year, this.month - 1, 1);
+            const lastDay = new Date(this.year, this.month, 0);
+            const firstStr = firstDay.toISOString().split('T')[0];
+            const lastStr = lastDay.toISOString().split('T')[0];
+
+            const allTasks = await Firestore.getTasks();
+            const filtered = allTasks.filter(t => t.due_date && t.due_date >= firstStr && t.due_date <= lastStr);
+            
+            this.tasksByDate = {};
+            filtered.forEach(t => {
+                if (!this.tasksByDate[t.due_date]) this.tasksByDate[t.due_date] = [];
+                this.tasksByDate[t.due_date].push(t);
+            });
+
+            document.getElementById('cal-title').textContent = `${new Date(this.year, this.month - 1).toLocaleString('default', { month: 'long' })} ${this.year}`;
             this.renderGrid();
-        } catch (err) { App.toast(err.message, 'error'); }
+        } catch (err) {
+            console.error('Calendar load error:', err);
+        }
     },
 
     renderGrid() {
         const grid = document.getElementById('cal-grid');
-        const d = this.data;
         const today = new Date().toISOString().split('T')[0];
+        const daysInMonth = new Date(this.year, this.month, 0).getDate();
+        const firstDayWeekday = (new Date(this.year, this.month - 1, 1).getDay() + 6) % 7;
 
         // Day headers
         let html = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(n => `<div class="calendar-day-header">${n}</div>`).join('');

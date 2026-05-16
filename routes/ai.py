@@ -1,58 +1,64 @@
 """
 AI Insights Routes
 ==================
-Rule-based "AI" engine that provides:
-  - Completion percentage and trend analysis
-  - Smart task suggestions for today
-  - Overdue risk scoring
-  - Productivity score
-No external API keys needed — all computed server-side.
+Rule-based "AI" engine. Data from Firebase Firestore.
 """
 
 from datetime import datetime, date, timedelta, timezone
 from flask import Blueprint, jsonify
 from flask_login import login_required, current_user
-from extensions import db
-from models.task import Task
+from firebase_admin import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 ai_bp = Blueprint("ai", __name__)
 
+def get_db():
+    return firestore.client()
 
 def _priority_weight(priority):
-    """Map priority to numeric weight."""
     return {"high": 3, "medium": 2, "low": 1}.get(priority, 1)
-
 
 @ai_bp.route("/insights", methods=["GET"])
 @login_required
 def insights():
-    """
-    Compute AI insights:
-      - completion_pct: overall completion percentage
-      - productivity_score: 0-100 score based on multiple factors
-      - overdue_risks: tasks at risk of becoming overdue
-      - streak: consecutive days with at least one completion
-    """
-    all_tasks = Task.query.filter_by(user_id=current_user.id).all()
+    db = get_db()
+    docs = db.collection("tasks").where(filter=FieldFilter("user_id", "==", current_user.id)).stream()
+    
+    all_tasks = []
+    for doc in docs:
+        task = doc.to_dict()
+        task["id"] = doc.id
+        # Convert string dates back to date objects for calculation
+        if task.get("due_date"):
+            try: task["due_date_obj"] = date.fromisoformat(task["due_date"])
+            except: task["due_date_obj"] = None
+        else: task["due_date_obj"] = None
+        
+        if task.get("completed_at"):
+            try: task["completed_at_obj"] = datetime.fromisoformat(task["completed_at"])
+            except: task["completed_at_obj"] = None
+        else: task["completed_at_obj"] = None
+        
+        all_tasks.append(task)
+
     today = date.today()
 
     total = len(all_tasks)
-    completed = sum(1 for t in all_tasks if t.status == "completed")
+    completed = sum(1 for t in all_tasks if t.get("status") == "completed")
     pending = total - completed
     completion_pct = round((completed / total) * 100, 1) if total > 0 else 0
 
     # ─── Overdue Risk Analysis ───
     overdue_risks = []
     for task in all_tasks:
-        if task.status == "completed" or not task.due_date:
+        if task.get("status") == "completed" or not task.get("due_date_obj"):
             continue
 
-        days_until_due = (task.due_date - today).days
-        priority_w = _priority_weight(task.priority)
+        days_until_due = (task["due_date_obj"] - today).days
+        priority_w = _priority_weight(task.get("priority"))
 
-        # Risk score: higher priority + closer deadline = higher risk
         if days_until_due < 0:
-            risk = 100  # already overdue
+            risk = 100
             risk_label = "Overdue"
         elif days_until_due == 0:
             risk = 90
@@ -68,48 +74,41 @@ def insights():
             risk_label = "Low Risk"
 
         risk = min(100, risk)
+        # remove injected objects before returning
+        clean_task = {k:v for k,v in task.items() if not k.endswith("_obj")}
         overdue_risks.append({
-            "task": task.to_dict(),
+            "task": clean_task,
             "risk_score": risk,
             "risk_label": risk_label,
             "days_until_due": days_until_due,
         })
 
-    # Sort by risk score descending
     overdue_risks.sort(key=lambda x: x["risk_score"], reverse=True)
 
     # ─── Productivity Score ───
-    # Factors: completion rate, on-time rate, recent activity
     on_time = 0
     completed_with_due = 0
     for task in all_tasks:
-        if task.status == "completed" and task.due_date and task.completed_at:
+        if task.get("status") == "completed" and task.get("due_date_obj") and task.get("completed_at_obj"):
             completed_with_due += 1
-            if task.completed_at.date() <= task.due_date:
+            if task["completed_at_obj"].date() <= task["due_date_obj"]:
                 on_time += 1
 
     on_time_rate = (on_time / completed_with_due * 100) if completed_with_due > 0 else 50
-    completion_rate = completion_pct
 
-    # Recent activity bonus: tasks completed in last 7 days
     week_ago = datetime.now(timezone.utc) - timedelta(days=7)
     recent_completions = sum(
         1 for t in all_tasks
-        if t.status == "completed" and t.completed_at and t.completed_at >= week_ago
+        if t.get("status") == "completed" and t.get("completed_at_obj") and t["completed_at_obj"] >= week_ago
     )
     activity_bonus = min(20, recent_completions * 4)
 
-    productivity_score = min(100, round(
-        (completion_rate * 0.4) + (on_time_rate * 0.4) + activity_bonus
-    ))
+    productivity_score = min(100, round((completion_pct * 0.4) + (on_time_rate * 0.4) + activity_bonus))
 
     # ─── Streak calculation ───
     streak = 0
     check_date = today
-    completed_dates = set()
-    for t in all_tasks:
-        if t.status == "completed" and t.completed_at:
-            completed_dates.add(t.completed_at.date())
+    completed_dates = {t["completed_at_obj"].date() for t in all_tasks if t.get("status") == "completed" and t.get("completed_at_obj")}
 
     while check_date in completed_dates:
         streak += 1
@@ -122,7 +121,7 @@ def insights():
         "pending": pending,
         "productivity_score": productivity_score,
         "on_time_rate": round(on_time_rate, 1),
-        "overdue_risks": overdue_risks[:10],  # top 10 risks
+        "overdue_risks": overdue_risks[:10],
         "streak_days": streak,
         "recent_completions_7d": recent_completions,
     }), 200
@@ -131,65 +130,65 @@ def insights():
 @ai_bp.route("/suggestions", methods=["GET"])
 @login_required
 def suggestions():
-    """
-    AI suggests which tasks to complete today.
-    Scoring: priority weight + due-date urgency + task age.
-    Returns the top tasks sorted by suggestion score.
-    """
-    today = date.today()
-    pending_tasks = Task.query.filter_by(
-        user_id=current_user.id, status="pending"
-    ).all()
+    db = get_db()
+    docs = db.collection("tasks").where(filter=FieldFilter("user_id", "==", current_user.id)).where(filter=FieldFilter("status", "==", "pending")).stream()
+    
+    pending_tasks = []
+    for doc in docs:
+        task = doc.to_dict()
+        task["id"] = doc.id
+        if task.get("due_date"):
+            try: task["due_date_obj"] = date.fromisoformat(task["due_date"])
+            except: task["due_date_obj"] = None
+        else: task["due_date_obj"] = None
+        
+        if task.get("created_at"):
+            try: task["created_at_obj"] = datetime.fromisoformat(task["created_at"])
+            except: task["created_at_obj"] = None
+        else: task["created_at_obj"] = None
+        
+        pending_tasks.append(task)
 
+    today = date.today()
     scored = []
     for task in pending_tasks:
         score = 0
+        score += _priority_weight(task.get("priority")) * 10
 
-        # Priority weight (high=30, medium=20, low=10)
-        score += _priority_weight(task.priority) * 10
-
-        # Due date urgency
-        if task.due_date:
-            days_until = (task.due_date - today).days
-            if days_until < 0:
-                score += 50  # overdue — highest urgency
-            elif days_until == 0:
-                score += 40  # due today
-            elif days_until == 1:
-                score += 30  # due tomorrow
-            elif days_until <= 3:
-                score += 20
-            elif days_until <= 7:
-                score += 10
+        if task.get("due_date_obj"):
+            days_until = (task["due_date_obj"] - today).days
+            if days_until < 0: score += 50
+            elif days_until == 0: score += 40
+            elif days_until == 1: score += 30
+            elif days_until <= 3: score += 20
+            elif days_until <= 7: score += 10
         else:
-            score += 5  # no due date gets a small base score
+            score += 5
 
-        # Task age bonus (older pending tasks get a nudge)
-        if task.created_at:
-            age_days = (datetime.now(timezone.utc) - task.created_at).days
-            score += min(15, age_days * 1)  # cap at 15
+        if task.get("created_at_obj"):
+            age_days = (datetime.now(timezone.utc) - task["created_at_obj"]).days
+            score += min(15, age_days * 1)
 
         reason_parts = []
-        if task.due_date and (task.due_date - today).days < 0:
-            reason_parts.append("Overdue")
-        elif task.due_date and (task.due_date - today).days == 0:
-            reason_parts.append("Due today")
-        elif task.due_date and (task.due_date - today).days == 1:
-            reason_parts.append("Due tomorrow")
+        if task.get("due_date_obj"):
+            days_until = (task["due_date_obj"] - today).days
+            if days_until < 0: reason_parts.append("Overdue")
+            elif days_until == 0: reason_parts.append("Due today")
+            elif days_until == 1: reason_parts.append("Due tomorrow")
 
-        if task.priority == "high":
+        if task.get("priority") == "high":
             reason_parts.append("High priority")
 
-        if task.created_at and (datetime.now(timezone.utc) - task.created_at).days > 7:
+        if task.get("created_at_obj") and (datetime.now(timezone.utc) - task["created_at_obj"]).days > 7:
             reason_parts.append("Pending for over a week")
 
+        clean_task = {k:v for k,v in task.items() if not k.endswith("_obj")}
         scored.append({
-            "task": task.to_dict(),
+            "task": clean_task,
             "score": score,
             "reason": ", ".join(reason_parts) if reason_parts else "General recommendation",
         })
 
-    # Sort by score descending, return top suggestions
     scored.sort(key=lambda x: x["score"], reverse=True)
 
     return jsonify({
